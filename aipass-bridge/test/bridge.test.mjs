@@ -225,6 +225,66 @@ test('a generated image comes back as a markdown image', async (t) => {
   assert.match(body.choices[0].message.content, /!\[image\]\(data:image\/png;base64,/);
 });
 
+test('/v1/images/generations returns OpenAI format with url', async (t) => {
+  const png = 'data:image/png;base64,iVBORw0KGgo=';
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => { await e.image(png); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const body = await fetch(`${bridge.base}/v1/images/generations`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a cute puppy' }),
+  }).then((r) => r.json());
+
+  assert.ok(Array.isArray(body.data), 'body.data is an array');
+  assert.equal(body.data.length, 1);
+  assert.equal(body.data[0].url, png);
+  assert.equal(typeof body.created, 'number');
+});
+
+test('/v1/images/generations returns b64_json format when requested', async (t) => {
+  const rawB64 = 'iVBORw0KGgo=';
+  const png = `data:image/png;base64,${rawB64}`;
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => { await e.image(png); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  const body = await fetch(`${bridge.base}/v1/images/generations`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a kitten', response_format: 'b64_json' }),
+  }).then((r) => r.json());
+
+  assert.ok(Array.isArray(body.data));
+  assert.equal(body.data[0].b64_json, rawB64);
+});
+
+test('/v1/images/generations maps size to aspect ratio and rejects missing prompt', async (t) => {
+  const ext = await new FakeExtension(bridge.base, {
+    onChat: async (job, e) => { await e.image('data:image/png;base64,abc'); await e.done(); },
+  }).connect();
+  t.after(() => ext.disconnect());
+
+  await fetch(`${bridge.base}/v1/images/generations`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'a portrait', size: '1024x1792' }),
+  });
+  assert.equal(ext.chats.at(-1).aspectRatio, '3:4', 'portrait size maps to 3:4');
+
+  await fetch(`${bridge.base}/v1/images/generations`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'a landscape', size: '1792x1024' }),
+  });
+  assert.equal(ext.chats.at(-1).aspectRatio, '4:3', 'landscape size maps to 4:3');
+
+  const errRes = await fetch(`${bridge.base}/v1/images/generations`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: '' }),
+  });
+  assert.equal(errRes.status, 400);
+});
+
 test('the aspect ratio reaches the extension, and a request can override it', async (t) => {
   const ext = await new FakeExtension(bridge.base, {
     onChat: async (job, e) => { await e.text('ok'); await e.done(); },

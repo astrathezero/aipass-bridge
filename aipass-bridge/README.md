@@ -461,6 +461,27 @@ The aspect ratio rides on the same `imageAspectRatio` field the web UI sends.
 A request can set `aspect_ratio`, `POST /config {"aspectRatio":"4:3"}` sets the
 default, and `AIPASS_ASPECT_RATIO` sets it at startup.
 
+### Native OpenAI Images API (`/v1/images/generations`)
+
+The bridge also exposes the standard OpenAI Images API endpoint, allowing any OpenAI SDK, AI agent (Hermes, Claude Desktop, CrewAI, LangChain), or client application to generate images natively:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8787/v1", api_key="sk-dummy")
+response = client.images.generate(
+    model="gpt-image-2",
+    prompt="A cute fluffy cat sitting in a cozy cafe",
+    size="1024x1024",  # or aspect_ratio="1:1", "3:4", "4:3"
+    response_format="url",  # or "b64_json"
+)
+
+# Returns standard OpenAI Images Response
+print("Image URL / Data URI:", response.data[0].url)
+```
+
+Supports `model`, `prompt`, `size` / `aspect_ratio`, `response_format` (`url` or `b64_json`), and image-to-image editing via `POST /v1/images/edits`.
+
 ### A worked example
 
 This came out of one command. The prompt is a heading and a ten-row CSV of a
