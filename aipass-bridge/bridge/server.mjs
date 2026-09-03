@@ -459,82 +459,182 @@ async function fetchRemoteImageAsDataUri(urlStr) {
   return `data:${contentType};base64,${base64}`;
 }
 
-// Extract multimodal parts (text and images) from OpenAI formatted messages
-async function extractUserParts(messages) {
-  const lastUser = (messages ?? []).filter((m) => m.role === 'user').at(-1);
-  if (!lastUser) return { text: '', parts: [] };
+// Extract tool calls (JSON array, XML <tool_call>, or single JSON object) from text
+function extractToolCallsFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
 
-  if (typeof lastUser.content === 'string') {
-    const text = lastUser.content.trim();
-    return {
-      text,
-      parts: text ? [{ type: 'text', text }] : []
-    };
+  // 1. Check for ```json ... ``` or raw JSON with "tool_calls"
+  const toolCallsMatch = trimmed.match(/\{[\s\S]*"tool_calls"\s*:\s*\[[\s\S]*\][\s\S]*\}/);
+  if (toolCallsMatch) {
+    try {
+      const parsed = JSON.parse(toolCallsMatch[0]);
+      if (Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+        return parsed.tool_calls.map((tc) => ({
+          id: tc.id || `call_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+          type: 'function',
+          function: {
+            name: tc.name || tc.function?.name,
+            arguments: typeof tc.arguments === 'string'
+              ? tc.arguments
+              : JSON.stringify(tc.arguments || tc.function?.arguments || {}),
+          },
+        })).filter((tc) => tc.function.name);
+      }
+    } catch (_) {}
   }
 
-  if (Array.isArray(lastUser.content)) {
-    const parts = [];
-    const textPieces = [];
-
-    for (const item of lastUser.content) {
-      if (!item || typeof item !== 'object') continue;
-
-      if (item.type === 'text' && typeof item.text === 'string') {
-        const t = item.text.trim();
-        if (t) {
-          textPieces.push(t);
-          parts.push({ type: 'text', text: t });
+  // 2. Check for <tool_call> tags
+  const tagMatches = [...trimmed.matchAll(/<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g)];
+  if (tagMatches.length > 0) {
+    const calls = [];
+    for (const match of tagMatches) {
+      try {
+        const raw = match[1].trim();
+        const parsed = JSON.parse(raw);
+        const name = parsed.name || parsed.function?.name;
+        if (name) {
+          calls.push({
+            id: parsed.id || `call_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+            type: 'function',
+            function: {
+              name,
+              arguments: typeof parsed.arguments === 'string'
+                ? parsed.arguments
+                : JSON.stringify(parsed.arguments || parsed.function?.arguments || {}),
+            },
+          });
         }
-      } else if (item.type === 'image_url') {
-        const rawUrl = item.image_url?.url || item.url || (typeof item.image === 'string' ? item.image : null);
-        if (typeof rawUrl === 'string' && rawUrl.trim()) {
-          const urlStr = rawUrl.trim();
-          let dataUri = '';
-          if (urlStr.startsWith('data:image/')) {
-            dataUri = urlStr;
-          } else if (/^https?:\/\//i.test(urlStr)) {
-            try {
-              dataUri = await fetchRemoteImageAsDataUri(urlStr);
-            } catch (err) {
-              log(`warning: failed to fetch remote image ${urlStr}: ${err.message}`);
+      } catch (_) {}
+    }
+    if (calls.length > 0) return calls;
+  }
+
+  // 3. Check for single JSON tool call: {"name": "...", "arguments": {...}}
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      const name = parsed.name || parsed.function?.name;
+      if (name && (parsed.arguments || parsed.parameters)) {
+        return [{
+          id: parsed.id || `call_${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+          type: 'function',
+          function: {
+            name,
+            arguments: typeof parsed.arguments === 'string'
+              ? parsed.arguments
+              : JSON.stringify(parsed.arguments || parsed.parameters || {}),
+          },
+        }];
+      }
+    } catch (_) {}
+  }
+
+  return null;
+}
+
+// Extract multimodal parts (text and images) from OpenAI formatted messages
+async function extractUserParts(messages, payload = {}) {
+  const msgs = Array.isArray(messages) ? messages : [];
+  const lastUser = msgs.filter((m) => m.role === 'user').at(-1);
+  if (!lastUser && !msgs.some((m) => m.role === 'system')) return { text: '', parts: [] };
+
+  const parts = [];
+  const textPieces = [];
+
+  const processContent = async (content) => {
+    if (typeof content === 'string') {
+      const t = content.trim();
+      if (t) textPieces.push(t);
+      return;
+    }
+    if (Array.isArray(content)) {
+      for (const item of content) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.type === 'text' && typeof item.text === 'string') {
+          const t = item.text.trim();
+          if (t) {
+            textPieces.push(t);
+            parts.push({ type: 'text', text: t });
+          }
+        } else if (item.type === 'image_url') {
+          const rawUrl = item.image_url?.url || item.url || (typeof item.image === 'string' ? item.image : null);
+          if (typeof rawUrl === 'string' && rawUrl.trim()) {
+            const urlStr = rawUrl.trim();
+            let dataUri = '';
+            if (urlStr.startsWith('data:image/')) {
+              dataUri = urlStr;
+            } else if (/^https?:\/\//i.test(urlStr)) {
+              try {
+                dataUri = await fetchRemoteImageAsDataUri(urlStr);
+              } catch (err) {
+                log(`warning: failed to fetch remote image ${urlStr}: ${err.message}`);
+              }
             }
+            if (dataUri) parts.push({ type: 'image', image: dataUri });
           }
-          if (dataUri) {
-            parts.push({
-              type: 'image',
-              image: dataUri
-            });
-          }
-        }
-      } else if (item.type === 'image' || item.type === 'file') {
-        // Same handling as image_url: a remote URL goes through the SSRF guard
-        // and arrives as a data URI, so the extension never fetches it.
-        const raw = item.image || item.url || item.data || '';
-        if (typeof raw === 'string' && raw.trim()) {
-          const s = raw.trim();
-          let dataUri = '';
-          if (s.startsWith('data:')) {
-            dataUri = s;
-          } else if (/^https?:\/\//i.test(s)) {
-            try {
-              dataUri = await fetchRemoteImageAsDataUri(s);
-            } catch (err) {
-              log(`warning: failed to fetch remote image ${s}: ${err.message}`);
+        } else if (item.type === 'image' || item.type === 'file') {
+          const raw = item.image || item.url || item.data || '';
+          if (typeof raw === 'string' && raw.trim()) {
+            const s = raw.trim();
+            let dataUri = '';
+            if (s.startsWith('data:')) {
+              dataUri = s;
+            } else if (/^https?:\/\//i.test(s)) {
+              try {
+                dataUri = await fetchRemoteImageAsDataUri(s);
+              } catch (err) {
+                log(`warning: failed to fetch remote image ${s}: ${err.message}`);
+              }
             }
+            if (dataUri) parts.push({ type: 'image', image: dataUri });
           }
-          if (dataUri) parts.push({ type: 'image', image: dataUri });
         }
       }
     }
+  };
 
-    const text = textPieces.join('\n').trim();
+  const forwardSystem = process.env.AIPASS_FORWARD_SYSTEM === '1' ||
+                        process.env.AIPASS_FORWARD_SYSTEM === 'true' ||
+                        Boolean(payload.tools?.length) ||
+                        Boolean(payload.forward_system);
+
+  if (forwardSystem) {
+    const systemMsgs = msgs.filter((m) => m.role === 'system');
+    const systemTexts = systemMsgs.map((m) => typeof m.content === 'string' ? m.content.trim() : '').filter(Boolean);
+
+    let preamble = systemTexts.join('\n\n');
+
+    if (payload.tools && Array.isArray(payload.tools) && payload.tools.length > 0) {
+      const toolDefs = JSON.stringify(payload.tools.map((t) => t.function || t), null, 2);
+      const toolInstruction = `\n\n[Available Tools & Functions]\n${toolDefs}\n\nWhen you need to call a tool, reply ONLY with a JSON object in this format:\n{\n  "tool_calls": [\n    {\n      "name": "<function_name>",\n      "arguments": { "<param>": "<val>" }\n    }\n  ]\n}`;
+      if (!preamble.includes('tool_calls') && !preamble.includes('Available Tools')) {
+        preamble += toolInstruction;
+      }
+    }
+
+    if (lastUser) {
+      await processContent(lastUser.content);
+    }
+
+    const userText = textPieces.join('\n').trim();
+    const combined = preamble ? `${preamble}\n\n${userText}`.trim() : userText;
+
     return {
-      text: text || (parts.length ? '[Image]' : ''),
-      parts: parts.length ? parts : (text ? [{ type: 'text', text }] : [])
+      text: combined || (parts.length ? '[Image]' : ''),
+      parts: parts.length ? parts : (combined ? [{ type: 'text', text: combined }] : [])
     };
   }
 
-  return { text: '', parts: [] };
+  if (lastUser) {
+    await processContent(lastUser.content);
+  }
+
+  const text = textPieces.join('\n').trim();
+  return {
+    text: text || (parts.length ? '[Image]' : ''),
+    parts: parts.length ? parts : (text ? [{ type: 'text', text }] : [])
+  };
 }
 
 /* ------------------------------------------------------------ http plumbing */
@@ -577,7 +677,7 @@ async function chatCompletions(req, res) {
   // Not an OpenAI field, so a client that knows about it can send either
   // spelling; otherwise the bridge default applies.
   const ratio = String(payload.aspect_ratio ?? payload.imageAspectRatio ?? aspectRatio).trim() || '1:1';
-  const { text, parts } = await extractUserParts(payload.messages);
+  const { text, parts } = await extractUserParts(payload.messages, payload);
   if (!text && (!parts || parts.length === 0)) return oaiError(res, 400, 'no user message');
 
   const id = `chatcmpl-${randomUUID().replace(/-/g, '').slice(0, 24)}`;
@@ -601,6 +701,20 @@ async function chatCompletions(req, res) {
     };
     emit({ role: 'assistant', content: '' });
 
+    let out = '';
+    const hasToolsRequested = Boolean(payload.tools && Array.isArray(payload.tools) && payload.tools.length > 0);
+    let buffer = [];
+    let isBuffering = hasToolsRequested;
+
+    const flushBuffer = () => {
+      if (buffer.length > 0) {
+        for (const textChunk of buffer) {
+          emit({ content: textChunk });
+        }
+        buffer = [];
+      }
+    };
+
     const job = startChat({
       modelId: model, text, parts, aspectRatio: ratio,
       onDelta: (part) => {
@@ -612,12 +726,35 @@ async function chatCompletions(req, res) {
         }
         // Chat completions have no field for a generated image, so it goes into
         // the content as markdown — which every client already renders.
-        if (part.kind === 'image') return void emit({ content: `\n![image](${part.text})\n` });
+        if (part.kind === 'image') {
+          out += `\n![image](${part.text})\n`;
+          return void emit({ content: `\n![image](${part.text})\n` });
+        }
         if (part.kind === 'reasoning') emit({ reasoning_content: part.text });
-        else emit({ content: part.text });
+        else {
+          out += part.text;
+          if (isBuffering) {
+            buffer.push(part.text);
+            const trimmed = out.trimStart();
+            // If the start does not match potential tool calls ({, `, <), stop buffering and flush
+            if (trimmed.length > 0 && !trimmed.startsWith('{') && !trimmed.startsWith('`') && !trimmed.startsWith('<')) {
+              isBuffering = false;
+              flushBuffer();
+            }
+          } else {
+            emit({ content: part.text });
+          }
+        }
       },
       onDone: (finishReason) => {
-        emit({}, finishReason === 'length' ? 'length' : 'stop');
+        const toolCalls = extractToolCallsFromText(out);
+        const hasTools = Boolean(toolCalls && toolCalls.length > 0);
+        if (hasTools) {
+          emit({ tool_calls: toolCalls }, 'tool_calls');
+        } else {
+          flushBuffer();
+          emit({}, finishReason === 'length' ? 'length' : 'stop');
+        }
         res.write('data: [DONE]\n\n');
         res.end();
       },
@@ -643,12 +780,19 @@ async function chatCompletions(req, res) {
         else out += p.text;
       },
       onDone: (finishReason) => {
+        const toolCalls = extractToolCallsFromText(out);
+        const hasTools = Boolean(toolCalls && toolCalls.length > 0);
         json(res, 200, {
           id, object: 'chat.completion', created, model,
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: out, ...(reasoning ? { reasoning_content: reasoning } : {}) },
-            finish_reason: finishReason === 'length' ? 'length' : 'stop',
+            message: {
+              role: 'assistant',
+              content: hasTools ? null : out,
+              ...(hasTools ? { tool_calls: toolCalls } : {}),
+              ...(reasoning ? { reasoning_content: reasoning } : {}),
+            },
+            finish_reason: hasTools ? 'tool_calls' : (finishReason === 'length' ? 'length' : 'stop'),
           }],
           // Estimates: the upstream stream reports no token counts, but some
           // clients refuse a response without a usage block.

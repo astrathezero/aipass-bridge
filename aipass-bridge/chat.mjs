@@ -37,7 +37,8 @@ const NEW = argv.includes('--new');
 let model = flag('model', null);
 const OUT_DIR = path.resolve(flag('out', process.cwd()));
 const RATIO = flag('ratio', null);
-const question = argv.filter((a, i) => !a.startsWith('--') && !argv[i - 1]?.startsWith('--')).join(' ').trim();
+const VALUE_FLAGS = new Set(['--model', '--conversation', '--bridge', '--ratio', '--out', '--paste-idle']);
+const question = argv.filter((a, i) => !a.startsWith('--') && !VALUE_FLAGS.has(argv[i - 1])).join(' ').trim();
 
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 const cyan = (s) => `\x1b[36m${s}\x1b[0m`;
