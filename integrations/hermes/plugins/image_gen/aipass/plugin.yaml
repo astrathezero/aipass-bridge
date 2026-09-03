@@ -1,0 +1,5 @@
+name: aipass
+version: 1.0.0
+description: "AIPass Bridge image generation backend (gpt-image-2, gemini-3-pro-image, seedream, ...) via OpenAI-compatible /v1/images/generations."
+author: Astra Serm
+kind: backend
